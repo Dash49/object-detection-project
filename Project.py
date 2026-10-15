@@ -70,7 +70,7 @@ def load_model():
 def letterbox(frame, size=IMGSZ):
     h, w = frame.shape[:2]
     r = min(size / w, size / h)
-    nw, nh = int(round(w * r)), int(round(h * r))
+    nw, nh = max(1, int(round(w * r))), max(1, int(round(h * r)))
     canvas = np.full((size, size, 3), 114, np.uint8)
     dx, dy = (size - nw) // 2, (size - nh) // 2
     canvas[dy:dy + nh, dx:dx + nw] = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
@@ -129,7 +129,7 @@ def run_model(frame, tile=False):
     fh, fw = frame.shape[:2]
     ids, confs, rects = raw_detect(frame)
     parts = [(ids, confs, rects, np.zeros(len(ids), bool))]
-    if tile:
+    if tile and min(fw, fh) >= 32:
         for x0, y0, tw, th in tiles(fw, fh):
             ids, confs, rects = raw_detect(frame[y0:y0 + th, x0:x0 + tw])
             cut = cut_by_tile(rects, x0, y0, tw, th, fw, fh)
@@ -408,7 +408,7 @@ def pick_file(title='เลือกไฟล์ภาพที่จะสแ�
 def read_image(path):
     try:
         return cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_COLOR)
-    except (OSError, ValueError):
+    except (OSError, ValueError, MemoryError, cv2.error):
         return None
 
 
@@ -426,7 +426,10 @@ def save_screenshot(frame):
     path, n = f'{stem}.jpg', 2
     while os.path.exists(path):
         path, n = f'{stem}_{n}.jpg', n + 1
-    cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    if not ok:
+        raise OSError(f'บันทึกภาพไม่ได้ : {path}')
+    buf.tofile(path)
     print(f'📷 บันทึกภาพหน้าจอ : {path}')
     return path
 
@@ -583,6 +586,8 @@ STATUS_TH = {'counted': 'นับ (ในพื้นที่)', 'outside': '�
 STATUS_ORDER = ('counted', 'outside', 'scene')
 HIGHLIGHT_COLOR = (0, 255, 255)
 UI_FONT = 'Tahoma'
+GUI_MAX_SIDE = 1600
+DRAFT_MSG = 'วาด ROI : คลิกซ้ายเพิ่มจุด  ·  คลิกขวาลบจุดล่าสุด  ·  Enter หรือ "บันทึก ROI" เพื่อบันทึก  ·  Esc ยกเลิก'
 
 
 def object_rows(detections, w, h):
@@ -652,7 +657,7 @@ class App:
         conf = ttk.Scale(bar, from_=5, to=95, variable=self.conf_var, length=160,
                          command=lambda v: self.conf_label.config(text=f'{float(v):.0f}%'))
         conf.pack(side='left', padx=6)
-        conf.bind('<ButtonRelease-1>', lambda e: self.on_conf())
+        conf.bind('<ButtonRelease>', lambda e: self.on_conf())
         conf.bind('<KeyRelease>', lambda e: self.on_conf())
         self.conf_label.pack(side='left')
 
@@ -699,8 +704,10 @@ class App:
         self.canvas.bind('<Button-3>', self.on_right_click)
 
     def bind_keys(self):
-        self.root.bind('<Control-o>', lambda e: self.open_file())
-        self.root.bind('<Control-s>', lambda e: self.save())
+        for key in ('o', 'O'):
+            self.root.bind(f'<Control-{key}>', lambda e: self.open_file())
+        for key in ('s', 'S'):
+            self.root.bind(f'<Control-{key}>', lambda e: self.save())
         self.root.bind('<Escape>', lambda e: self.cancel_draft())
         self.root.bind('<Return>', lambda e: self.finish_draft())
         for key, scene in KEY_SCENES.items():
@@ -718,24 +725,36 @@ class App:
         if not path:
             return
         image = read_image(path)
-        if image is None:
+        if image is None or min(image.shape[:2]) < 3:
             messagebox.showerror('อ่านภาพไม่ได้', f'เปิดไฟล์นี้ไม่ได้ :\n{path}', parent=self.root)
             return
+        s = GUI_MAX_SIDE / max(image.shape[:2])
+        if s < 1:
+            image = cv2.resize(image, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        previous = self.path, self.image
         self.path, self.image = path, image
         self.set_scene(scene or guess_scene(path) or CURRENT_SCENE, refresh=False)
-        self.detect()
+        if not self.detect():
+            self.path, self.image = previous
+            self.refresh()
 
     def detect(self):
         if self.image is None:
-            return
+            return False
         self.status.set(f'กำลังสแกน {os.path.basename(self.path)} …')
         self.root.config(cursor='watch')
         self.root.update_idletasks()
         start = time.time()
-        self.detections = run_model(self.image, tile=TILING)
-        self.elapsed = time.time() - start
-        self.root.config(cursor='')
+        try:
+            detections = run_model(self.image, tile=TILING)
+        except (cv2.error, ValueError, ZeroDivisionError, MemoryError) as e:
+            messagebox.showerror('สแกนไม่สำเร็จ', str(e), parent=self.root)
+            return False
+        finally:
+            self.root.config(cursor='')
+        self.detections, self.elapsed = detections, time.time() - start
         self.refresh()
+        return True
 
     def refresh(self):
         if self.image is None:
@@ -747,7 +766,8 @@ class App:
         self.fill_text()
         self.fill_tree()
         counted = sum(r[3] == 'counted' for r in self.rows)
-        self.status.set(f'{os.path.basename(self.path)}  ·  สแกนเสร็จใน {self.elapsed:.2f} วินาที  ·  '
+        self.status.set(DRAFT_MSG if self.draft is not None else
+                        f'{os.path.basename(self.path)}  ·  สแกนเสร็จใน {self.elapsed:.2f} วินาที  ·  '
                         f'ตรวจพบ {len(self.rows)} ชิ้น  ·  อยู่ในพื้นที่ {counted} ชิ้น')
 
     def set_scene(self, scene, refresh=True):
@@ -770,7 +790,7 @@ class App:
     def on_conf(self):
         global CONF_THRESHOLD
         value = round(self.conf_var.get()) / 100
-        if value != CONF_THRESHOLD:
+        if value != round(CONF_THRESHOLD * 100) / 100:
             CONF_THRESHOLD = value
             self.detect()
 
@@ -906,7 +926,7 @@ class App:
             return
         self.draft = []
         self.roi_btn.config(text='บันทึก ROI')
-        self.status.set('วาด ROI : คลิกซ้ายเพิ่มจุด  ·  คลิกขวาลบจุดล่าสุด  ·  Enter หรือ "บันทึก ROI" เพื่อบันทึก  ·  Esc ยกเลิก')
+        self.status.set(DRAFT_MSG)
         self.render()
 
     def finish_draft(self):
@@ -988,8 +1008,14 @@ def main():
         return 1
 
     if args.source == 'pick':
-        return run_gui(save=args.save, scene=fixed_scene)
-    if not args.source.isdigit() and not os.path.exists(args.source) \
+        if not (args.no_show or args.draw_roi):
+            CURRENT_SCENE = fixed_scene or CURRENT_SCENE
+            return run_gui(save=args.save, scene=fixed_scene)
+        args.source = pick_file()
+        if not args.source:
+            print('ยกเลิก — ไม่ได้เลือกไฟล์')
+            return 1
+    elif not args.source.isdigit() and not os.path.exists(args.source) \
             and os.path.exists(os.path.join(BASE, args.source)):
         args.source = os.path.join(BASE, args.source)
 
